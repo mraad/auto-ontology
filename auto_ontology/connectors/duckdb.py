@@ -76,12 +76,28 @@ class DuckDBDatabase(SQLDatabase):
             if db_path in ("", ":memory:")
             else str(Path(db_path).resolve())
         )
+        self._load_spatial()
         self._database_name: str = self.execute("SELECT current_database()").iloc[0, 0]
         logger.debug(
             "DuckDB connected (database=%r, read_only=%s).",
             self._database_name,
             read_only,
         )
+
+    def _load_spatial(self) -> None:
+        """Load the spatial extension, so ``GEOMETRY`` columns and ``ST_*`` functions work.
+
+        A plain connection does not autoload it: ``ST_Point`` fails with "exists
+        in the spatial extension" until ``LOAD spatial``. ``INSTALL`` downloads it
+        once into the user's extension directory; without network or a writable
+        directory the connection still serves every non-spatial query, so a
+        failure here is a warning, not an error.
+        """
+        try:
+            self.conn.execute("INSTALL spatial")
+            self.conn.execute("LOAD spatial")
+        except duckdb.Error as exc:
+            logger.warning("DuckDB spatial extension not loaded: %s", exc)
 
     @property
     def dialect(self) -> str:
