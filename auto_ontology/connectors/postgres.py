@@ -161,6 +161,12 @@ class PostgresDatabase(SQLDatabase):
               AND n.nspname NOT LIKE 'pg\\_%'
               AND c.relispartition = false
               AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+              -- PostGIS (or any extension) owns tables such as spatial_ref_sys and the
+              -- geometry_columns views; they describe the database, not the data.
+              AND NOT EXISTS (
+                  SELECT 1 FROM pg_depend d
+                  WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e'
+              )
               -- Restores what information_schema filtered for free: a relation
               -- the ingesting role cannot read must not be catalogued, or
               -- text-to-SQL will offer it and every query dies with
@@ -177,7 +183,10 @@ class PostgresDatabase(SQLDatabase):
         that reached the catalog would arrive with no columns at all.
 
         ``format_type(atttypid, NULL)`` gives the unqualified type name without
-        precision (``character varying``, not ``character varying(255)``). It is
+        precision (``character varying``, not ``character varying(255)``).
+        PostGIS ``geometry`` and ``geography`` keep their modifier
+        (``geometry(Point,4326)``): the shape type and SRID are the column's
+        meaning, and text-to-SQL needs the SRID to write a correct predicate. It is
         **not** identical to ``information_schema.columns.data_type``, which
         flattens a domain to its base type and reports ``ARRAY`` /
         ``USER-DEFINED`` where this reports ``text[]`` / ``mpaa_rating``. The
@@ -199,7 +208,10 @@ class PostgresDatabase(SQLDatabase):
                 n.nspname                        AS table_schema,
                 c.relname                        AS table_name,
                 a.attname                        AS column_name,
-                format_type(a.atttypid, NULL)    AS data_type,
+                CASE WHEN t.typname IN ('geometry', 'geography')
+                    THEN format_type(a.atttypid, a.atttypmod)
+                    ELSE format_type(a.atttypid, NULL)
+                END                              AS data_type,
                 NOT a.attnotnull                 AS is_nullable,
                 row_number() OVER (
                     PARTITION BY c.oid ORDER BY a.attnum
@@ -207,10 +219,17 @@ class PostgresDatabase(SQLDatabase):
             FROM pg_attribute a
             JOIN pg_class c ON c.oid = a.attrelid
             JOIN pg_namespace n ON n.oid = c.relnamespace
+            JOIN pg_type t ON t.oid = a.atttypid
             WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
               AND n.nspname NOT LIKE 'pg\\_%'
               AND c.relispartition = false
               AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+              -- PostGIS (or any extension) owns tables such as spatial_ref_sys and the
+              -- geometry_columns views; they describe the database, not the data.
+              AND NOT EXISTS (
+                  SELECT 1 FROM pg_depend d
+                  WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e'
+              )
               AND has_table_privilege(c.oid, 'SELECT')
               AND a.attnum > 0
               AND NOT a.attisdropped
