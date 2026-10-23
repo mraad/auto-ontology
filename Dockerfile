@@ -124,7 +124,14 @@ EOF
 # License and attribution files (OSRB): see CONTAINER_THIRD_PARTY_NOTICES.md.
 COPY LICENSE THIRD_PARTY_NOTICES.md CONTAINER_THIRD_PARTY_NOTICES.md OPEN_SOURCE_NOTICE /licenses/
 
+# DuckDB's spatial extension, installed at build into the app user's extension
+# directory: /app is root-owned, so the connector's INSTALL on connect could not
+# write ~/.duckdb, and a runtime install would need network. LOAD stays offline.
+RUN install -d -o auto_ontology -g auto_ontology /app/.duckdb
+
 USER auto_ontology
+
+RUN python -c "import duckdb; duckdb.connect().execute('INSTALL spatial')"
 
 EXPOSE 3001
 
