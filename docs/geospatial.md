@@ -1,6 +1,6 @@
 # Geospatial data in Auto Ontology
 
-Status: 2026-10-23 · Fork: `mraad/auto-ontology` · Base: NVIDIA `main` at `643993e7` (1.1.0) · Test data: NorthSea (ArcGIS project, 3 layers, 11,056 features)
+Status: 2026-10-25 · Fork: `mraad/auto-ontology` · Base: NVIDIA `main` at `643993e7` (1.1.0) · Test data: NorthSea (ArcGIS project, 3 layers, 11,056 features)
 
 This document is for the Auto Ontology engineers at NVIDIA. It tells what this fork changes so that Auto Ontology can answer questions on spatial data. It also gives the problems that we found when we ran the full stack, and a proposed fix for each problem.
 
@@ -72,6 +72,34 @@ Each rule also becomes an Ossie metric. Ossie's converter `converters/nvidia` ma
 
 Without §2.1, only the four analyses without a spatial predicate run. With §2.1, all seven run. The PostGIS connection (§2.3) gives the same counts.
 
+### 3.1 Rules, monitors and actions
+
+A geo-ontology rulebook (`examples/northsea/rules.json`) has three parts. It is data, not code. Validators check it against the catalog before it runs. Only `scripts/watch.py` executes it.
+
+| Part | What it is | NorthSea |
+|---|---|---|
+| Rule | A named Plan. It is a derived entity with the attributes, ids and valid time of its base layer. A rule can use another rule as its entity or target. | 7 rules. `WellNearGasLine` uses `InServiceGasPipeline`. `ConcurrentDrilling` uses `DatedWell`. |
+| Monitor | A rule that runs at each snapshot of the data. An event is a change of its result: `enter` or `exit`. | `gas_line_watch` on `WellNearGasLine`. `drilling_watch` on `ConcurrentDrilling`, for the last 3650 days. |
+| Action | `notify` a channel, `export` the event features, `recommend` with a Plan over the event features (`$event`), or run `code` in a sandbox. An action does not write to a source. | `notify_ops`, `export_wells`, `nearby_producing` (producing discoveries within 5 km of the event wells). |
+
+The sequence of `watch.py`:
+
+1. `tick` runs the rule of each monitor. With `--cross-check`, two engines must give the same ids.
+2. `tick` compares the ids with the previous tick and records the `enter` and `exit` events in a hash-chained ledger.
+3. `tick` makes one request for each action and event kind. `export` and `recommend` run on the host at once. `notify` and `code` stay `pending` unless the watch policy approves them automatically.
+4. When the policy has a `trust` key, an automatic approval also needs a signed rule concept in the OKF bundle of the project.
+5. `approve` releases a pending request. `dispatch` sends it in an OpenShell sandbox, or publishes it to a bus topic.
+6. `verify` runs each tick again from the same source bytes and compares the digests.
+
+NorthSea, with `--cross-check --dry-run`:
+
+| Monitor | Tick 2024-09-30 | Tick 2026-10-01 |
+|---|---|---|
+| `gas_line_watch` | enter 65: notify (pending), export, recommend | no change |
+| `drilling_watch` | enter 12: notify (pending), export | exit 3, 9 remain: notify (pending), export |
+
+Only the rules go to Auto Ontology, as custom analyses and link tables. The monitors and the actions stay in geo-ontology. Auto Ontology does not see the events, `$event` or the history of the ticks. Because an action does not write to a source, an action does not change the catalog of Auto Ontology. An agent that uses the read-only MCP server of Auto Ontology, and needs a notification, writes a monitor in geo-ontology. The watch policy and the signature of the rule then control the notification.
+
 ## 4. Run the stack on NorthSea
 
 Prerequisites:
@@ -125,9 +153,9 @@ For the two spatial questions, text-to-SQL used the link table. It did not use a
 | 2 | In the Docker image, the spatial install fails. | §2.2. | Merge `699d5fd0`, or set `extension_directory` to a writable path. |
 | 3 | The import of a model fails with `duplicate key value violates unique constraint "uq_catalog_database_name"`. This occurs with `replace=false` and with `replace=true`. | The ingestion service makes the catalog database first, from `CONNECTION_STRINGS`. `_resolve_entities_batch` finds an existing row only by `imported_id` or `id`, not by name. The import then tries to make a second row with the same name. | When no row has the `imported_id`, find the database (and its schemas, tables and columns) by name, and set `imported_id` on that row. A workaround is to import before the first ingest (§4, steps 7 to 10). |
 | 4 | Each answer is `LLM failed to produce a response.` The log has `[410] Gone ... 'nvidia/nemotron-3-nano-30b-a3b' has reached its end of life on 2026-09-01`. | The default model of `.env.example` is retired. | Change the default model in `.env.example`, in the Helm values and in `README.md`. |
-| 5 | An answer takes approximately 4 minutes. The log has `[400] unknown field guided_json` for `QuestionIntentModel`, `QuestionExtractionModel` and `TableRelevanceModel`. | The structured-output request of `langchain_nvidia_ai_endpoints` sends a field that the hosted endpoint refuses. Each step tries 3 times, then uses a default value. | Upgrade `langchain_nvidia_ai_endpoints`, or send the JSON schema in the form that the endpoint accepts (for example `response_format`). We did not try this. |
+| 5 | An answer takes approximately 4 minutes. The log has `[400] unknown field guided_json` for `QuestionIntentModel`, `QuestionExtractionModel` and `TableRelevanceModel`. | The structured-output request of `langchain_nvidia_ai_endpoints` sends a field that the hosted endpoint refuses. Each step tries 3 times, then uses a default value. | Upgrade `langchain_nvidia_ai_endpoints`, or send the JSON schema in the form that the endpoint accepts (for example `response_format`). The branch `fix/nvidia-models-and-token-caps` (`21d5a41b`, not on `main`) adds `<role>_CLIENT=openai\|nvidia` and asks nemotron for structured output through tool calls. We did not try this. |
 | 6 | The import fails with `ON CONFLICT DO UPDATE command cannot affect row a second time`. | The primary key of `table__join` is `(source_table_id, target_table_id)`. A model cannot have two joins between the same two tables. Our link table `ConcurrentDrilling__Wells` has two foreign keys to `Wells` (`primary_id` and `target_id`). | Give each join its own key, or include `join_columns` in the key. A table with two foreign keys to one table is common (for example `flight.origin` and `flight.destination` to `airport`). geo-ontology now declares only the first join of such a link table. |
-| 7 | The DuckDB connector shows a geometry column as `GEOMETRY`, without an SRID. | DuckDB 1.5 `GEOMETRY` has no CRS. | Optional: read the CRS from a table such as `sp_ref`, or from the column comment, and add it to the column description. |
+| 7 | The DuckDB connector shows a geometry column as `GEOMETRY`, without an SRID. | DuckDB 1.5 `GEOMETRY` has no CRS. | Optional: read the CRS from a table such as `sp_ref`, or from the column comment, and add it to the column description. geo-ontology already writes the CRS into the description of each geometry field, for example `Point geometry in EPSG:4326 (longitude, latitude).` The import keeps it as the column attribute. |
 | 8 | Text-to-SQL has no instructions for spatial SQL. For SQLite, the prompt prohibits spatial functions. | The prompt has no section for spatial dialects. | Optional: when a column type is `GEOMETRY` or `geometry(...)`, add the dialect's distance and transform functions to the prompt. Link tables made this unnecessary for the questions in §5. |
 
 ## 7. Tests
