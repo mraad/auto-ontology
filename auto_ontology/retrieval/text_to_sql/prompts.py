@@ -94,7 +94,11 @@ create_sql_user_prompt = (
     "- When evidence rules map to columns in different tables, include the joins "
     "that connect those tables using the listed paths. Choose the join type "
     "(INNER / LEFT / RIGHT) from the question's intent and avoid fan-out from "
-    "many-to-many joins.\n\n"
+    "many-to-many joins.\n"
+    "- A listed join path is indivisible. If it contains intermediate or bridge "
+    "tables, include every table and every hop exactly as listed. Removing a "
+    "bridge table, skipping a hop, or replacing the path with a direct endpoint "
+    "join is forbidden, even when the bridge contributes no projected column.\n\n"
     "{join_paths}\n\n"
     "**Aggregation**\n"
     "- Never use FILTER (WHERE ...) on aggregates — it is not supported in all dialects. "
@@ -122,16 +126,18 @@ create_sql_user_prompt = (
     "{dialect_rules}"
     "{projection_rules}"
     "**Style**\n"
-    "- Preserve the natural row grain. Use SELECT DISTINCT only when the question "
-    "explicitly asks for distinct, different, or unique results; do not add it as "
-    "a precaution or to hide duplication caused by an incorrect join. For counts, "
-    "use COUNT(DISTINCT entity_identifier) when the question asks for unique "
-    "entities or a necessary one-to-many join would otherwise count the same "
-    "requested entity more than once. Use COUNT(*) when each input row represents "
-    "exactly one requested entity.\n"
-    "- When a projected field has `is_nullable: true` in the schema metadata, "
-    "add an `IS NOT NULL` predicate for that field so the result excludes rows "
-    "where the projected value is NULL.\n"
+    "- Preserve natural row grain. Use DISTINCT only when the question or authoritative "
+    "evidence explicitly asks for distinct, different, unique, or deduplicated results. "
+    "A foreign-key marker signals possible fan-out but does not require DISTINCT: "
+    "COUNT(fk) counts matching child rows; COUNT(DISTINCT fk) counts referenced entities. "
+    "Never infer DISTINCT solely from an FK, one-to-many join, repeated IDs, or an entity "
+    "noun.\n"
+    "- NULL filtering: Do not add `IS NOT NULL` solely because a projected field "
+    "has `is_nullable: true`, or because one or multiple fields are projected. "
+    "Add it only when the question or evidence requires the requested value to "
+    "exist. If the concept maps to one nullable column, check that column; if it "
+    "maps to a composite concept, check every required nullable component. "
+    "Otherwise, preserve rows containing NULLs.\n"
     "- Time windows: apply a date/year filter ONLY when the question's data "
     "request names a period; 'last week/month/year' then means the most "
     "recent completed calendar period, not a rolling window.\n"
@@ -218,6 +224,37 @@ _POSTGRES_DIALECT_RULES = (
 )
 
 
+# MySQL's ``/`` never truncates to an integer: it returns a DECIMAL with
+# div_precision_increment (by default 4, and Auto Ontology's MySQL connector
+# leaves it there) more decimal places than the dividend (integer
+# division is the separate DIV operator). So the generic "cast to REAL before
+# dividing" rule only adds casts here, and the model's MySQL cast of choice,
+# DECIMAL(p, s), changes the digits of the result. Exact graders compare
+# values as strings (BEAVER's ex_acc: 150.250000 != 150.25), so a cast result
+# fails even when the query is otherwise right. The one cast worth keeping
+# widens a small ratio a subquery or CTE stores, which keeps only those 4
+# places and divides as zero later; within one expression MySQL keeps the
+# precision itself.
+_MYSQL_DIALECT_RULES = (
+    "**MySQL-specific (these OVERRIDE the generic rules above)**\n"
+    "- `/` never truncates in MySQL: integer / integer returns a DECIMAL with, "
+    "by default, 4 more decimal places (1 / 3 = 0.3333). Do NOT cast to make "
+    "a division fractional; the generic 'cast to REAL before dividing' rule "
+    "does not apply.\n"
+    "- Do NOT CAST a computed value (an aggregate, average, ratio or window "
+    "result), or the column inside it, to DECIMAL(p, s), FLOAT, DOUBLE or REAL, "
+    "and do not ROUND it, unless the question asks for a precision or for "
+    "rounding: a cast changes the result's digits. Return computed values as "
+    "MySQL produces them. The one exception: a ratio computed in a subquery "
+    "or CTE keeps only 4 decimal places (1 / 1000000 = 0.0000), so if it is "
+    "divided again later, cast its dividend to a DECIMAL with more scale.\n"
+    "- STDDEV(), STD() and VARIANCE() are the POPULATION statistics in MySQL "
+    "(the same as STDDEV_POP() and VAR_POP()). Use the function the question "
+    "names; use STDDEV_SAMP() or VAR_SAMP() only when it asks for a sample "
+    "statistic.\n\n"
+)
+
+
 # Shared output-field spec for SQL-generation prompts (candidates-based and
 # table-based) — kept as a single source so the two call sites can't drift.
 _SQL_GENERATION_OUTPUT_SPEC = """Output (fill fields in this exact order):
@@ -243,7 +280,9 @@ def format_dialect_rules(dialect: str | None) -> str:
     SQLite lacks many functions the model habitually emits (spatial,
     LEAST/GREATEST, stats aggregates, EXTRACT/DATE_TRUNC). Snowflake needs
     identifier-quoting and VARIANT/FLATTEN guidance for case-sensitive
-    lowercase columns (Spider2 PATENTS etc.). Returns '' for other dialects.
+    lowercase columns (Spider2 PATENTS etc.). MySQL needs the generic
+    division-cast rule lifted, since its casts round results. Returns '' for
+    other dialects.
     """
     normalized = (dialect or "").strip().lower()
     if normalized == "sqlite":
@@ -252,6 +291,8 @@ def format_dialect_rules(dialect: str | None) -> str:
         return _SNOWFLAKE_DIALECT_RULES
     if normalized in ("postgres", "postgresql"):
         return _POSTGRES_DIALECT_RULES
+    if normalized == "mysql":
+        return _MYSQL_DIALECT_RULES
     return ""
 
 
@@ -374,7 +415,9 @@ ORDER BY total_sales DESC;"""
   when it fits. Never force the semantic hint if it doesn't match the question.
 - SUGGESTED JOIN PATHS show verified column-level join conditions:
 {join_template}
-  Follow hops in order when the path spans more than one table.
+  Follow hops in order when the path spans more than one table. Once you choose
+  a path, every intermediate/bridge table and every listed hop is mandatory.
+  Never shorten the path or join its endpoints directly.
 - DOMAIN-SPECIFIC CUSTOM ANALYSES: if one closely matches the question, use or
   adapt its full SQL directly as your starting point — you may reuse it wholesale,
   trimming only what does not apply. Do NOT copy its aliases.

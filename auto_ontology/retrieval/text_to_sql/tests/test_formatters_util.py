@@ -108,6 +108,54 @@ def test_used_schema_context_keeps_details_only_for_referenced_columns() -> None
     assert "unused" not in rendered
 
 
+def test_used_schema_context_marks_semantic_fk() -> None:
+    rendered = format_used_schema_for_prompt(
+        [
+            {
+                "name": "orders",
+                "schema_name": "public",
+                "columns": [
+                    {
+                        "name": "customer_id",
+                        "data_type": "integer",
+                        "semantic_fk": "public.customers.id",
+                    }
+                ],
+            }
+        ],
+        used_tables=["public.orders"],
+        used_columns=["public.orders.customer_id"],
+    )
+
+    assert "foreign_key: public.customers.id" in rendered
+
+
+def test_available_tables_mark_semantic_fk_on_ordinary_columns() -> None:
+    rendered = format_tables_for_prompt(
+        [
+            {
+                "name": "orders",
+                "schema_name": "public",
+                "columns": [
+                    {
+                        "name": "id",
+                        "data_type": "integer",
+                        "semantic_fk": None,
+                    },
+                    {
+                        "name": "customer_id",
+                        "data_type": "integer",
+                        "semantic_fk": "public.customers.id",
+                    },
+                ],
+            }
+        ]
+    )
+
+    assert "column | type | is_nullable | foreign key" in rendered
+    assert "customer_id | integer | unknown | public.customers.id" in rendered
+
+
 def test_prompt_renders_catalog_qualified_name_for_spark_tables() -> None:
     """The model copies these names verbatim, so the catalog has to survive."""
     rendered = format_tables_for_prompt(
@@ -286,6 +334,43 @@ def test_semantic_context_falls_back_to_target_db_for_bridge_hops() -> None:
     )
 
     assert "lakehouse.lakehouse.clusters.id = lakehouse.lakehouse.events.id" in rendered
+
+
+def test_semantic_context_keeps_every_hop_through_a_bridge_table() -> None:
+    rendered = format_semantic_context(
+        {"schema_name": "public", "table_name": "orders", "col_name": "id"},
+        [
+            {
+                "attr_name": "Region",
+                "col_name": "id",
+                "schema_name": "public",
+                "table_name": "regions",
+                "path": [
+                    {
+                        "source_schema": "public",
+                        "source_table": "orders",
+                        "source_column": "account_id",
+                        "target_schema": "public",
+                        "target_table": "accounts",
+                        "target_column": "id",
+                    },
+                    {
+                        "source_schema": "public",
+                        "source_table": "accounts",
+                        "source_column": "region_id",
+                        "target_schema": "public",
+                        "target_table": "regions",
+                        "target_column": "id",
+                    },
+                ],
+            }
+        ],
+    )
+
+    assert "selected path is indivisible" in rendered
+    assert "public.orders.account_id = public.accounts.id" in rendered
+    assert "public.accounts.region_id = public.regions.id" in rendered
+    assert "public.accounts.id = public.accounts.region_id" not in rendered
 
 
 def test_semantic_context_matches_table_section_spelling() -> None:

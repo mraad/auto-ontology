@@ -18,6 +18,7 @@ from auto_ontology.retrieval.text_to_sql.formatters_util import (
 from auto_ontology.retrieval.text_to_sql.prompts import (
     create_sql_from_candidates_prompt,
     create_sql_user_prompt,
+    format_dialect_rules,
     format_projection_rules,
 )
 from auto_ontology.retrieval.text_to_sql.models import SQLGenerationModel
@@ -73,11 +74,47 @@ def test_prompt_does_not_prefer_fewer_joins() -> None:
         create_sql_user_prompt
     )
     assert "include the joins that connect those tables" in create_sql_user_prompt
+    assert "include every table and every hop exactly as listed" in (
+        create_sql_user_prompt
+    )
+    assert "every intermediate/bridge table and every listed hop is mandatory" in (
+        system_prompt
+    )
 
 
-def test_prompt_filters_nulls_from_nullable_projected_fields() -> None:
-    assert "projected field has `is_nullable: true`" in create_sql_user_prompt
-    assert "add an `IS NOT NULL` predicate for that field" in create_sql_user_prompt
+def test_prompt_filters_nulls_only_when_the_request_requires_values() -> None:
+    assert "Do not add `IS NOT NULL` solely because" in create_sql_user_prompt
+    assert "question or evidence requires the requested value" in (
+        create_sql_user_prompt
+    )
+    assert "preserve rows containing NULLs" in create_sql_user_prompt
+
+
+def test_prompt_does_not_infer_distinct_from_foreign_keys() -> None:
+    assert "Use DISTINCT only when the question or authoritative evidence" in (
+        create_sql_user_prompt
+    )
+    assert "COUNT(fk) counts matching child rows" in create_sql_user_prompt
+    assert "Never infer DISTINCT solely from an FK" in create_sql_user_prompt
+    assert "necessary one-to-many join" not in create_sql_user_prompt
+
+
+def test_mysql_rules_lift_the_division_cast_and_forbid_rounding_casts() -> None:
+    rules = format_dialect_rules("MySQL")
+
+    assert rules == format_dialect_rules("mysql")
+    # The generic rule the MySQL block overrides is still in the shared prompt.
+    assert "Cast to REAL before dividing" in create_sql_user_prompt
+    assert "`/` never truncates in MySQL" in rules
+    assert "4 more decimal places" in rules
+    assert "rule does not apply" in rules
+    assert "DECIMAL(p, s), FLOAT, DOUBLE or REAL" in rules
+    # Only a ratio too small for 4 decimal places may be widened.
+    assert "1 / 1000000 = 0.0000" in rules
+    assert "POPULATION statistics" in rules
+    # Other dialects keep their own rules.
+    for dialect in ("sqlite", "postgres", "snowflake", None):
+        assert "MySQL" not in format_dialect_rules(dialect)
 
 
 def test_projection_strictness_is_configured_per_request() -> None:
